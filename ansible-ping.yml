@@ -1,6 +1,6 @@
 ---
 - name: Test Connectivity to All Hosts
-  hosts: all
+  hosts: lab_servers
   gather_facts: false
   tasks:
     - name: Ping hosts
