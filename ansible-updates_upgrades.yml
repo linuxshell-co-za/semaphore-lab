@@ -1,0 +1,85 @@
+---
+# Basic update & upgrade for Ubuntu 22.04 / 24.04
+# Usage: ansible-playbook -i inventory.ini update-ubuntu.yml
+#        ansible-playbook -i inventory.ini update-ubuntu.yml -e reboot_if_required=true
+
+- name: Update and upgrade Ubuntu servers
+  hosts: lab_servers
+  become: true
+  serial: "{{ update_serial | default('100%') }}"   # e.g. -e update_serial=2 for rolling updates
+
+  vars:
+    upgrade_type: dist          # 'dist' (handles new deps/kernels) or 'safe'
+    autoremove: true
+    reboot_if_required: false
+
+  # These stop the interactive prompts that cause Ansible to hang
+  environment:
+    DEBIAN_FRONTEND: noninteractive   # debconf: never ask questions, use defaults
+    NEEDRESTART_MODE: a               # needrestart: restart services automatically
+    UCF_FORCE_CONFOLD: "1"            # ucf-managed configs: keep the existing file
+    APT_LISTCHANGES_FRONTEND: none    # don't page changelogs
+
+  tasks:
+    - name: Make sure we are on a supported release
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == 'Ubuntu'
+          - ansible_facts['distribution_version'] in ['22.04', '24.04']
+        fail_msg: "Unsupported OS: {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}"
+        quiet: true
+
+    - name: Check whether needrestart is installed
+      ansible.builtin.stat:
+        path: /etc/needrestart/conf.d
+      register: needrestart_dir
+
+    - name: Configure needrestart to never prompt
+      ansible.builtin.copy:
+        dest: /etc/needrestart/conf.d/50-ansible-noninteractive.conf
+        content: |
+          # Managed by Ansible - prevents interactive prompts during apt runs
+          $nrconf{restart} = 'a';
+          $nrconf{kernelhints} = -1;
+        owner: root
+        group: root
+        mode: "0644"
+      when: needrestart_dir.stat.exists
+
+    - name: List packages on hold (apt-mark)
+      ansible.builtin.command: apt-mark showhold
+      register: held_packages
+      changed_when: false
+
+    - name: Show held packages
+      ansible.builtin.debug:
+        msg: "Held packages (will not be upgraded): {{ held_packages.stdout_lines | default([]) | join(', ') or 'none' }}"
+
+    - name: Update apt cache and upgrade packages
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+        upgrade: "{{ upgrade_type }}"
+        dpkg_options: "force-confdef,force-confold"   # never prompt about changed config files
+        autoremove: "{{ autoremove }}"
+        lock_timeout: 300                              # wait for unattended-upgrades instead of failing
+      register: apt_result
+
+    - name: Check whether a reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Report reboot status
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: reboot
+          {{ 'REQUIRED' if reboot_required.stat.exists else 'not required' }}
+
+    - name: Reboot if required and allowed
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+        msg: "Rebooting after Ansible package upgrade"
+      when:
+        - reboot_if_required | bool
+        - reboot_required.stat.exists
