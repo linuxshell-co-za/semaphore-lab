@@ -1,0 +1,80 @@
+---
+# Reboot Ubuntu servers that need it (based on /var/run/reboot-required)
+# Usage: ansible-playbook -i inventory.ini reboot-ubuntu.yml
+#        ansible-playbook -i inventory.ini reboot-ubuntu.yml -e reboot_serial=2
+#        ansible-playbook -i inventory.ini reboot-ubuntu.yml -e force_reboot=true
+
+- name: Reboot Ubuntu servers that require it
+  hosts: lab_servers
+  become: true
+  serial: "{{ reboot_serial | default(1) }}"   # one host at a time by default
+  max_fail_percentage: 0                       # stop the whole run if any host fails to come back
+
+  vars:
+    force_reboot: false        # reboot even if the flag file is absent
+    reboot_timeout: 900        # seconds to wait for the host to come back
+
+  tasks:
+    - name: Check for reboot-required flag
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_flag
+
+    - name: Skip hosts that don't need a reboot
+      ansible.builtin.meta: end_host
+      when:
+        - not reboot_flag.stat.exists
+        - not (force_reboot | bool)
+
+    - name: Read packages that triggered the reboot flag
+      ansible.builtin.command: cat /var/run/reboot-required.pkgs
+      register: reboot_pkgs
+      changed_when: false
+      failed_when: false
+
+    - name: Record kernel and boot time before reboot
+      ansible.builtin.command: uname -r
+      register: kernel_before
+      changed_when: false
+
+    - name: Show why this host is rebooting
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Reason: {{ 'flag file present' if reboot_flag.stat.exists else 'forced' }}"
+          - "Triggered by: {{ (reboot_pkgs.stdout_lines | default([]) | unique | join(', ')) or 'n/a' }}"
+          - "Kernel before: {{ kernel_before.stdout }}"
+
+    - name: Reboot and wait for the host to come back
+      ansible.builtin.reboot:
+        msg: "Reboot initiated by Ansible (reboot-required)"
+        reboot_timeout: "{{ reboot_timeout }}"
+        pre_reboot_delay: 5
+        post_reboot_delay: 30
+        test_command: whoami
+
+    - name: Record kernel after reboot
+      ansible.builtin.command: uname -r
+      register: kernel_after
+      changed_when: false
+
+    - name: Confirm the reboot flag is cleared
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_flag_after
+
+    - name: Report result
+      ansible.builtin.debug:
+        msg:
+          - "Kernel: {{ kernel_before.stdout }} -> {{ kernel_after.stdout }}"
+          - "Reboot flag still present: {{ reboot_flag_after.stat.exists }}"
+
+    - name: Check for failed systemd units after reboot
+      ansible.builtin.command: systemctl list-units --state=failed --no-legend --plain
+      register: failed_units
+      changed_when: false
+
+    - name: Warn about failed units
+      ansible.builtin.debug:
+        msg: "Failed units on {{ inventory_hostname }}: {{ failed_units.stdout_lines }}"
+      when: failed_units.stdout_lines | length > 0
