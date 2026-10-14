@@ -1,0 +1,129 @@
+---
+# Install Apache + PHP 8.3 (FPM) + tooling on Ubuntu 22.04 / 24.04
+# Usage: ansible-playbook -i inventory.ini install-web-stack.yml
+
+- name: Install Apache, PHP 8.3 and supporting packages
+  hosts: lab_servers
+  become: true
+
+  vars:
+    php_version: "8.3"
+    # 22.04 ships PHP 8.1, so PHP 8.3 comes from the ondrej/php PPA there.
+    # 24.04 ships PHP 8.3 natively, so no PPA is needed.
+    use_php_ppa: "{{ ansible_facts['distribution_version'] == '22.04' }}"
+
+    # Redis extension package name differs: PPA uses php8.3-redis, Ubuntu 24.04 uses php-redis
+    php_redis_package: "{{ 'php' ~ php_version ~ '-redis' if use_php_ppa else 'php-redis' }}"
+
+    base_packages:
+      - apache2
+      - apache2-utils
+      - unzip
+      - git
+      - curl
+      - rsync
+      - net-tools
+      - mysql-client-core-8.0
+
+    php_packages:
+      - "php{{ php_version }}"
+      - "php{{ php_version }}-cli"
+      - "php{{ php_version }}-common"
+      - "php{{ php_version }}-mysql"
+      - "php{{ php_version }}-xml"
+      - "php{{ php_version }}-curl"
+      - "php{{ php_version }}-mbstring"
+      - "php{{ php_version }}-zip"
+      - "php{{ php_version }}-bcmath"
+      - "php{{ php_version }}-intl"
+      - "php{{ php_version }}-gd"
+      - "php{{ php_version }}-opcache"
+      - "{{ php_redis_package }}"
+
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+    NEEDRESTART_MODE: a
+
+  tasks:
+    - name: Make sure we are on a supported release
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == 'Ubuntu'
+          - ansible_facts['distribution_version'] in ['22.04', '24.04']
+        fail_msg: "Unsupported OS: {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}"
+        quiet: true
+
+    - name: Install prerequisites for adding a PPA (22.04 only)
+      ansible.builtin.apt:
+        name: software-properties-common
+        state: present
+        update_cache: true
+      when: use_php_ppa | bool
+
+    - name: Add ondrej/php PPA (22.04 only)
+      ansible.builtin.apt_repository:
+        repo: ppa:ondrej/php
+        state: present
+        update_cache: true
+      when: use_php_ppa | bool
+
+    - name: Install base packages
+      ansible.builtin.apt:
+        name: "{{ base_packages }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+        lock_timeout: 300
+
+    # Installed on its own first so the php8.3 metapackage's dependency is
+    # satisfied by FPM rather than pulling in libapache2-mod-php8.3.
+    - name: Install PHP-FPM
+      ansible.builtin.apt:
+        name: "php{{ php_version }}-fpm"
+        state: present
+        lock_timeout: 300
+
+    - name: Install PHP and extensions
+      ansible.builtin.apt:
+        name: "{{ php_packages }}"
+        state: present
+        lock_timeout: 300
+
+    - name: Enable Apache modules needed for PHP-FPM
+      ansible.builtin.command: "a2enmod {{ item }}"
+      args:
+        creates: "/etc/apache2/mods-enabled/{{ item }}.load"
+      loop:
+        - proxy_fcgi
+        - setenvif
+      notify: Restart apache2
+
+    - name: Enable PHP-FPM config in Apache
+      ansible.builtin.command: "a2enconf php{{ php_version }}-fpm"
+      args:
+        creates: "/etc/apache2/conf-enabled/php{{ php_version }}-fpm.conf"
+      notify: Restart apache2
+
+    - name: Ensure services are enabled and running
+      ansible.builtin.service:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop:
+        - "php{{ php_version }}-fpm"
+        - apache2
+
+    - name: Verify PHP version
+      ansible.builtin.command: "php{{ php_version }} -v"
+      register: php_check
+      changed_when: false
+
+    - name: Show PHP version
+      ansible.builtin.debug:
+        msg: "{{ php_check.stdout_lines | first }}"
+
+  handlers:
+    - name: Restart apache2
+      ansible.builtin.service:
+        name: apache2
+        state: restarted
