@@ -4,7 +4,7 @@
 #        ansible-playbook -i inventory.ini update-ubuntu.yml -e reboot_if_required=true
 
 - name: Update and upgrade Ubuntu servers
-  hosts: lab_servers
+  hosts: public-facing-us
   become: true
   serial: "{{ update_serial | default('100%') }}"   # e.g. -e update_serial=2 for rolling updates
 
